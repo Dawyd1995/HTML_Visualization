@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cyberpunk City V6 - High Performance</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', Courier, monospace; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        
+        /* HUD UI */
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #0ff;
+            pointer-events: none;
+            text-shadow: 0 0 5px #0ff;
+            background: rgba(0, 5, 10, 0.85);
+            padding: 15px;
+            border: 1px solid #0ff;
+            border-radius: 4px;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+            z-index: 10;
+            width: 250px;
+        }
+        .hud-header { border-bottom: 1px solid #0ff; margin-bottom: 10px; padding-bottom: 5px; font-weight:900; letter-spacing: 1px;}
+        .hud-row { margin-bottom: 8px; display: flex; justify-content: space-between; font-size: 13px; }
+        .hud-label { font-weight: bold; opacity: 0.7; }
+        .hud-value { font-weight: bold; text-align: right; }
+        
+        /* Scanline Overlay */
+        .scan-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;
+            background: repeating-linear-gradient(0deg, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,255,255,0.03) 3px, rgba(0,0,0,0) 4px);
+            z-index: 5;
+        }
+
+        #loader {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #020202; display: flex; justify-content: center; align-items: center;
+            color: #0ff; z-index: 999; flex-direction: column;
+        }
+        
+        /* Hidden Input */
+        #file-input { display: none; }
+    </style>
+</head>
+<body>
+
+<div id="loader">
+    <h1 style="text-shadow: 0 0 20px #0ff;">INITIALIZING V6...</h1>
+    <div style="font-size: 0.8em; opacity: 0.7; margin-top: 10px;">Pre-calculating Vectors & Geometry</div>
+</div>
+
+<div class="scan-overlay"></div>
+
+<div id="hud">
+    <div class="hud-header">NEURAL LINK V6.0</div>
+    <div class="hud-row"><span class="hud-label">STATUS</span><span id="hud-status" class="hud-value" style="color:#0f0">ONLINE</span></div>
+    <div class="hud-row"><span class="hud-label">PROGRESS</span><span id="hud-progress" class="hud-value">0%</span></div>
+    <div class="hud-row"><span class="hud-label">AVG VALUE</span><span id="hud-avg" class="hud-value">0.00</span></div>
+    <div class="hud-row"><span class="hud-label">CUR VALUE</span><span id="hud-price" class="hud-value">0.00</span></div>
+    <div class="hud-row"><span class="hud-label">FPS</span><span id="hud-fps" class="hud-value">60</span></div>
+    <div class="hud-row" style="margin-top:10px; border-top:1px solid #333; padding-top:5px;">
+        <span class="hud-label">MODE</span><span id="hud-mode" class="hud-value">STABLE</span>
+    </div>
+</div>
+
+<div id="canvas-container"></div>
+<input type="file" id="file-input" accept=".json">
+
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+    // --- 1. CONFIGURATION (Daten & State getrennt) ---
+    
+    // Die Einstellungen, die gespeichert werden
+    const CONFIG = {
+        // System
+        paused: false,
+        loopTime: 90, // "Loop Time" aus V4
+        
+        // Generation (Parameter aus Screenshot V4/V5)
+        cityDensity: 0.8,
+        buildingScale: 1.2,
+        wallThreshold: 20,   // "Trend Value %"
+        windowSizePct: 10,   // "Window Size %"
+        
+        // Visuals (Parameter aus Screenshot V4)
+        bloomStrength: 1.5,
+        bloomRadius: 0.5,
+        bloomThreshold: 0.2, // Etwas höher für bessere Performance
+        fogDensity: 0.015,
+        palette: 'CYAN_MAGENTA',
+        
+        // Camera
+        cameraMode: 'FOLLOW_STABLE'
+    };
+
+    // Interner State (wird berechnet, nicht gespeichert)
+    const STATE = {
+        progress: 0,
+        time: 0,
+        fps: 60,
+        globalAvg: 0,
+        // Kamera Vectors
+        camForward: new THREE.Vector3(0,0,1),
+        camPosSmoothed: new THREE.Vector3(0,5,0),
+        camLookSmoothed: new THREE.Vector3(0,0,10),
+        currentDist: 8,
+        currentHeight: 4,
+        // Pre-calculated World Data
+        curve: null,
+        visualPrices: [],
+        wallData: [] // Positions for huge walls
+    };
+
+    // --- 2. ASSETS & HELPERS ---
+    
+    const PALETTES = {
+        CYAN_MAGENTA: { prim: '#00ffff', sec: '#ff00ff', sky: '#000810', fog: '#000810', grid: '#002233' },
+        AMBER_TEAL:   { prim: '#ffae00', sec: '#008080', sky: '#050300', fog: '#050300', grid: '#332200' },
+        NEON_GREEN:   { prim: '#39ff14', sec: '#8000ff', sky: '#020005', fog: '#020005', grid: '#113311' },
+        SYNTHWAVE:    { prim: '#ff71ce', sec: '#01cdfe', sky: '#120012', fog: '#120012', grid: '#330033' },
+        CRIMSON_DARK: { prim: '#ff0033', sec: '#aaaaaa', sky: '#080000', fog: '#080000', grid: '#330000' }
+    };
+
+    function createBuildingTexture(p1, p2) {
+        const c = document.createElement('canvas'); c.width=64; c.height=128;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#050505'; ctx.fillRect(0,0,64,128);
+        const cols = [p1, p2, '#ffffff', '#aaaaaa'];
+        for(let i=0; i<30; i++) {
+            ctx.fillStyle = cols[Math.floor(Math.random()*cols.length)];
+            const x = Math.floor(Math.random()*4)*16 + 2;
+            const y = Math.floor(Math.random()*8)*16 + 2;
+            const w = 10; const h = Math.random()>0.7 ? 26 : 8;
+            if(Math.random()>0.5) ctx.fillRect(x,y,w,h);
+        }
+        const tex = new THREE.CanvasTexture(c);
+        tex.magFilter = THREE.NearestFilter;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        return tex;
+    }
+
+    function createFogSprite() {
+        const c = document.createElement('canvas'); c.width=64; c.height=64; // Smaller texture for perf
+        const ctx = c.getContext('2d');
+        const g = ctx.createRadialGradient(32,32,0,32,32,32);
+        g.addColorStop(0, 'rgba(255,255,255,0.3)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g; ctx.fillRect(0,0,64,64);
+        return new THREE.CanvasTexture(c);
+    }
+
+    // --- 3. SCENE SETUP ---
+    
+    const container = document.getElementById('canvas-container');
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Cap PixelRatio for FPS
+    renderer.toneMapping = THREE.ReinhardToneMapping;
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, CONFIG.fogDensity);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 2000);
+
+    const renderPass = new RenderPass(scene, camera);
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+    const composer = new EffectComposer(renderer);
+    composer.addPass(renderPass);
+    composer.addPass(bloomPass);
+
+    // --- 4. CORE LOGIC: PRE-CALCULATION ---
+
+    // Objekte (werden wiederverwendet)
+    let meshRoute, iMeshBuildings, wallGroup, fogGroup, headGroup, headLight;
+    
+    function calculateWorldData() {
+        // Diese Funktion erstellt REINE Daten (Vektoren), keine Meshes.
+        // Sie läuft nur, wenn "Generation" Parameter geändert werden.
+        
+        const rawPoints = []; // Pure simulation data
+        STATE.visualPrices = [];
+        STATE.wallData = [];
+        const curvePoints = []; // 3D Vectors for the curve
+        
+        // 1. Simuliere Aktienkurs
+        let price = 100;
+        const totalPoints = 300; 
+        for(let i=0; i<totalPoints; i++) {
+            price += (Math.random() - 0.45) * 5;
+            if(price < 10) price = 10;
+            rawPoints.push(price);
+        }
+        
+        // Average
+        const sum = rawPoints.reduce((a,b)=>a+b,0);
+        STATE.globalAvg = sum / totalPoints;
+        document.getElementById('hud-avg').innerText = STATE.globalAvg.toFixed(2);
+
+        // 2. Pfad Analyse (Horizontal vs Vertical)
+        const thresholdVal = STATE.globalAvg * (CONFIG.wallThreshold / 100);
+        const windowSize = Math.max(1, Math.floor(totalPoints * (CONFIG.windowSizePct / 100)));
+        
+        let cx=0, cz=0, cy=0;
+        const stepSize = 10;
+
+        curvePoints.push(new THREE.Vector3(0,0,0));
+        STATE.visualPrices.push(rawPoints[0]);
+
+        let i = 0;
+        while(i < totalPoints - 1) {
+            // Lookahead
+            const lookIdx = Math.min(i + windowSize, totalPoints - 1);
+            const diff = rawPoints[lookIdx] - rawPoints[i];
+            
+            // Logic: Is this a huge jump?
+            let isVertical = false;
+            if(Math.abs(diff) > thresholdVal) isVertical = true;
+
+            if(isVertical) {
+                // -> Vertical Segment Generation
+                // 1. Base Point
+                const base = new THREE.Vector3(cx, cy, cz);
+                curvePoints.push(base);
+                STATE.visualPrices.push(rawPoints[i]);
+                
+                // 2. Calculate Height Change
+                const heightChange = diff * 1.5; // Scale height for drama
+                cy += heightChange;
+                
+                // 3. Top Point (Minimaler X/Z Versatz nötig für TubeGeometry Tangenten!)
+                // Wir gehen 0.1 units in die aktuelle Richtung weiter
+                const angle = Math.sin(i * 0.1) * 0.5;
+                const tinyOffset = 0.1;
+                cx += Math.sin(angle) * tinyOffset;
+                cz += Math.cos(angle) * tinyOffset;
+                
+                const top = new THREE.Vector3(cx, cy, cz);
+                curvePoints.push(top);
+                STATE.visualPrices.push(rawPoints[lookIdx]); // Preis ist am Top erreicht
+                
+                // Store Wall Data for Mesh Gen
+                STATE.wallData.push({
+                    pos: base.clone().lerp(top, 0.5),
+                    height: Math.abs(heightChange),
+                    lookAt: new THREE.Vector3(cx + Math.sin(angle)*10, cy, cz + Math.cos(angle)*10)
+                });
+                
+                // Wir haben die Strecke bis lookIdx "abgekürzt" durch den Sprung
+                i = lookIdx; 
+            } else {
+                // -> Normal Horizontal Move
+                const angle = Math.sin(i * 0.1) * 0.5 + (Math.random()-0.5)*0.2;
+                cx += Math.sin(angle) * stepSize;
+                cz += Math.cos(angle) * stepSize;
+                
+                // Leichtes Rauschen in Y, aber generell flach bleiben, wenn kein Jump
+                const noise = (Math.random()-0.5) * 0.5;
+                
+                curvePoints.push(new THREE.Vector3(cx, cy + noise, cz));
+                STATE.visualPrices.push(rawPoints[i+1]);
+                i++;
+            }
+        }
+        
+        // CatmullRomCurve für smoothness, tension 0.1 für "eckige" Sprünge
+        STATE.curve = new THREE.CatmullRomCurve3(curvePoints);
+        STATE.curve.tension = 0.1; 
+    }
+
+    function buildGeometry() {
+        // Diese Funktion baut Three.js Objekte basierend auf STATE.
+        
+        // 1. Clean Scene
+        if(meshRoute) scene.remove(meshRoute);
+        if(iMeshBuildings) scene.remove(iMeshBuildings);
+        if(wallGroup) scene.remove(wallGroup);
+        if(fogGroup) scene.remove(fogGroup);
+        if(headGroup) scene.remove(headGroup);
+
+        // 2. Build Route
+        // TubeGeometry ist teuer, wir machen das nur hier einmal.
+        // Segments hoch für smoothe Kurven, aber nicht zu hoch für FPS.
+        const tubeGeo = new THREE.TubeGeometry(STATE.curve, 2000, 0.5, 6, false);
+        tubeGeo.setDrawRange(0, 0); // Start unsichtbar
+        meshRoute = new THREE.Mesh(tubeGeo, new THREE.MeshBasicMaterial({ color: 0xffffff }));
+        scene.add(meshRoute);
+
+        // 3. Build Walls (Megastructures)
+        wallGroup = new THREE.Group();
+        const wallGeo = new THREE.BoxGeometry(1,1,1);
+        const matWall = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.2, emissive: 0xffffff, emissiveIntensity: 0.5 });
+        
+        STATE.wallData.forEach(w => {
+            const m = new THREE.Mesh(wallGeo, matWall);
+            m.position.copy(w.pos);
+            m.scale.set(15, w.height, 15);
+            m.lookAt(w.lookAt);
+            // Neon Strip Detail
+            const strip = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1, 1.1), new THREE.MeshBasicMaterial({color:0xffffff}));
+            strip.scale.set(1, w.height, 0.2);
+            m.add(strip);
+            wallGroup.add(m);
+        });
+        scene.add(wallGroup);
+
+        // 4. Build City (InstancedMesh)
+        const iCount = 3000;
+        const matBuild = new THREE.MeshStandardMaterial({
+            color: 0x111111, roughness: 0.1, metalness: 0.6,
+            emissive: 0xffffff, emissiveIntensity: 1.0
+        });
+        iMeshBuildings = new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1), matBuild, iCount);
+        
+        const dummy = new THREE.Object3D();
+        const spacedPoints = STATE.curve.getSpacedPoints(1500); // Sampling
+        let idx = 0;
+        
+        for(let i=0; i<spacedPoints.length; i++) {
+            if(idx >= iCount) break;
+            if(Math.random() > CONFIG.cityDensity) continue; // Density Slider
+
+            const pt = spacedPoints[i];
+            const u = i / spacedPoints.length;
+            const tan = STATE.curve.getTangentAt(u);
+
+            // Keine Gebäude an Wänden (wenn y-Tangente stark ist)
+            if(Math.abs(tan.y) > 0.5) continue;
+
+            const norm = new THREE.Vector3(0,1,0).cross(tan).normalize();
+            const side = Math.random() > 0.5 ? 1 : -1;
+            const dist = 8 + Math.random() * 25;
+
+            dummy.position.copy(pt).add(norm.multiplyScalar(dist * side));
+            dummy.position.y = pt.y; // Align to level
+            dummy.lookAt(pt.x, pt.y, pt.z);
+            
+            // Scale Slider
+            const s = CONFIG.buildingScale;
+            const w = (3 + Math.random()*5) * s;
+            const h = (5 + Math.random()*40) * s;
+            const d = (3 + Math.random()*5) * s;
+            
+            dummy.scale.set(w, h, d);
+            dummy.position.y += h/2;
+            dummy.updateMatrix();
+            iMeshBuildings.setMatrixAt(idx, dummy.matrix);
+            idx++;
+        }
+        iMeshBuildings.count = idx;
+        iMeshBuildings.instanceMatrix.needsUpdate = true;
+        scene.add(iMeshBuildings);
+
+        // 5. Fog Sprites (Optimized)
+        fogGroup = new THREE.Group();
+        const fogTex = createFogSprite();
+        const fogMat = new THREE.SpriteMaterial({ 
+            map: fogTex, color: 0xffffff, 
+            transparent: true, opacity: 0.1, 
+            blending: THREE.AdditiveBlending,
+            depthWrite: false 
+        });
+        for(let k=0; k<60; k++) { // Weniger Sprites für FPS
+            const s = new THREE.Sprite(fogMat);
+            s.scale.set(60,60,1);
+            s.userData = { speed: (Math.random()-0.5)*0.5 }; // Langsame Bewegung
+            fogGroup.add(s);
+        }
+        scene.add(fogGroup);
+        
+        // 6. Head
+        headGroup = new THREE.Group();
+        const headGeo = new THREE.ConeGeometry(0.5, 1.5, 4); headGeo.rotateX(Math.PI/2);
+        const headMesh = new THREE.Mesh(headGeo, new THREE.MeshBasicMaterial({ wireframe:true, color:0xffffff }));
+        headLight = new THREE.PointLight(0xffffff, 2, 40);
+        headGroup.add(headMesh); headGroup.add(headLight);
+        scene.add(headGroup);
+
+        updateVisuals(); // Farben anwenden
+    }
+
+    function updateVisuals() {
+        // Wendet nur Farben und Post-Processing an (kein Geometry rebuild)
+        const p = PALETTES[CONFIG.palette];
+        
+        bloomPass.strength = CONFIG.bloomStrength;
+        bloomPass.radius = CONFIG.bloomRadius;
+        bloomPass.threshold = CONFIG.bloomThreshold;
+        scene.fog.density = CONFIG.fogDensity;
+        scene.fog.color.set(p.fog);
+        scene.background = new THREE.Color(p.sky);
+
+        // Mats update
+        if(meshRoute) meshRoute.material.color.set(p.prim);
+        if(wallGroup) wallGroup.children.forEach(c => c.material.emissive.set(p.prim));
+        if(iMeshBuildings) {
+            const tex = createBuildingTexture(p.prim, p.sec);
+            iMeshBuildings.material.map = tex;
+            iMeshBuildings.material.emissiveMap = tex;
+            iMeshBuildings.material.needsUpdate = true;
+        }
+        if(fogGroup) fogGroup.children.forEach(s => s.material.color.set(p.sec));
+        if(headLight) headLight.color.set(p.prim);
+
+        // UI Colors
+        const hud = document.getElementById('hud');
+        hud.style.borderColor = p.prim;
+        hud.querySelector('.hud-header').style.borderBottomColor = p.prim;
+        hud.style.boxShadow = `0 0 15px ${p.prim}33`; // Hex alpha
+        document.querySelectorAll('.hud-value').forEach(e => e.style.color = p.prim);
+    }
+
+    // --- 5. ANIMATION LOOP (Optimiert) ---
+    
+    const clock = new THREE.Clock();
+    const _headPos = new THREE.Vector3();
+    const _backPos = new THREE.Vector3();
+    const _forward = new THREE.Vector3();
+    
+    function animate() {
+        requestAnimationFrame(animate);
+        
+        const dt = clock.getDelta(); // Real time delta
+        
+        if(!CONFIG.paused && STATE.curve) {
+            STATE.time += dt;
+            STATE.progress += dt / CONFIG.loopTime;
+            if(STATE.progress > 1) STATE.progress = 0;
+            
+            const u = STATE.progress;
+
+            // 1. Route Reveal (Sehr performant via setDrawRange)
+            // 2000 Segments * 6 Indices per Segment * 3 (wegen Tube faces) -> approx logic
+            const maxIndices = meshRoute.geometry.index.count;
+            const drawLimit = Math.floor(u * maxIndices);
+            // Snap to face size (3 indices) or segment size to avoid flicker
+            meshRoute.geometry.setDrawRange(0, Math.floor(drawLimit/6)*6);
+
+            // 2. Head Position
+            STATE.curve.getPointAt(u, _headPos);
+            const tan = STATE.curve.getTangentAt(u);
+            headGroup.position.copy(_headPos);
+            
+            // Orientierung Head
+            if(Math.abs(tan.y) > 0.9) {
+                // Senkrechtflug
+                headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), tan);
+            } else {
+                headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), tan);
+            }
+
+            // 3. Camera Logic (Stabiler Follow)
+            const lookBack = 0.005;
+            if(u < lookBack) _forward.copy(STATE.curve.getTangentAt(0));
+            else {
+                STATE.curve.getPointAt(u - lookBack, _backPos);
+                _forward.subVectors(_headPos, _backPos).normalize();
+            }
+
+            // Smoothing Direction
+            if(_forward.lengthSq() > 0.1) STATE.camForward.lerp(_forward, dt * 2.0);
+
+            // Modes
+            let tDist = 8, tHeight = 4, tLook = 6;
+            let swayX = 0, swayY = 0;
+
+            // Wall Detection (Zoom out bei Wänden)
+            if(Math.abs(_forward.y) > 0.5) {
+                tDist = 20; tHeight = 0; // Rückansicht bei Liftfahrt
+            }
+
+            if(CONFIG.cameraMode === 'FOLLOW_SWAY') {
+                swayX = Math.sin(STATE.time * 0.5) * 3;
+                swayY = Math.cos(STATE.time * 0.3) * 1;
+            } else if(CONFIG.cameraMode === 'DRONE_ORBIT') {
+                tDist = 15; tLook = 0;
+                swayX = Math.sin(STATE.time * 0.3) * 15;
+                tHeight = 10 + Math.cos(STATE.time * 0.2) * 5;
+            } else if(CONFIG.cameraMode === 'REAR_CHASE_LOW') {
+                tDist = 5; tHeight = 1.5;
+            }
+
+            STATE.currentDist += (tDist - STATE.currentDist) * dt * 2;
+            STATE.currentHeight += (tHeight - STATE.currentHeight) * dt * 2;
+
+            // Cam Position calc
+            const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), STATE.camForward).normalize();
+            const targetPos = _headPos.clone()
+                .sub(STATE.camForward.clone().multiplyScalar(STATE.currentDist))
+                .add(new THREE.Vector3(0, STATE.currentHeight, 0))
+                .add(right.multiplyScalar(swayX))
+                .add(new THREE.Vector3(0,1,0).multiplyScalar(swayY));
+
+            STATE.camPosSmoothed.lerp(targetPos, dt * 3.0);
+            camera.position.copy(STATE.camPosSmoothed);
+
+            const targetLook = _headPos.clone().add(STATE.camForward.clone().multiplyScalar(tLook));
+            STATE.camLookSmoothed.lerp(targetLook, dt * 4.0);
+            camera.lookAt(STATE.camLookSmoothed);
+
+            // 4. Fog Animation
+            fogGroup.children.forEach(s => {
+                s.position.x += s.userData.speed * dt;
+                // Wrap around camera to fake infinity
+                if(s.position.distanceTo(camera.position) > 150) {
+                    s.position.copy(camera.position).add(new THREE.Vector3((Math.random()-0.5)*100, (Math.random()-0.5)*30, (Math.random()-0.5)*100));
+                }
+            });
+
+            // 5. HUD Updates
+            document.getElementById('hud-progress').innerText = Math.floor(u*100) + '%';
+            
+            // Preis Mapping
+            const priceIdx = Math.floor(u * (STATE.visualPrices.length - 1));
+            if(STATE.visualPrices[priceIdx] !== undefined) {
+                document.getElementById('hud-price').innerText = STATE.visualPrices[priceIdx].toFixed(2);
+            }
+        }
+
+        document.getElementById('hud-fps').innerText = Math.round(1/dt);
+        composer.render();
+    }
+
+    // --- 6. SAVE / LOAD SYSTEM ---
+    
+    function saveSettings() {
+        const filename = prompt("Settings filename:", "my_cyberpunk_preset");
+        if(!filename) return; // Cancelled
+        
+        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(CONFIG));
+        const a = document.createElement('a');
+        a.href = dataStr;
+        a.download = filename + ".json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }
+
+    function loadSettings() {
+        document.getElementById('file-input').click();
+    }
+
+    document.getElementById('file-input').addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if(!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+            try {
+                const loaded = JSON.parse(evt.target.result);
+                Object.assign(CONFIG, loaded);
+                gui.controllers.forEach(c => c.updateDisplay());
+                // Subfolders recursive update
+                gui.folders.forEach(f => f.controllers.forEach(c => c.updateDisplay()));
+                
+                fullRebuild(); // Trigger rebuild mit neuen Settings
+            } catch(err) {
+                alert("Error loading JSON: " + err);
+            }
+        };
+        reader.readAsText(file);
+        // Reset value so same file can be loaded again
+        e.target.value = '';
+    });
+
+    // --- 7. GUI & STARTUP ---
+
+    function fullRebuild() {
+        calculateWorldData();
+        buildGeometry();
+    }
+
+    const gui = new GUI({ title: 'CYBER CONTROL V6' });
+    
+    const fSys = gui.addFolder('System');
+    fSys.add(CONFIG, 'paused').name('PAUSE').onChange(v => {
+        document.getElementById('hud-status').innerText = v ? "PAUSED" : "ONLINE";
+        document.getElementById('hud-status').style.color = v ? "#fa0" : "#0f0";
+    });
+    fSys.add({s:saveSettings}, 's').name('Save Settings');
+    fSys.add({l:loadSettings}, 'l').name('Load Settings');
+    fSys.add(CONFIG, 'loopTime', 30, 300).name('Loop Time');
+    fSys.add(CONFIG, 'cameraMode', ['FOLLOW_STABLE', 'FOLLOW_SWAY', 'DRONE_ORBIT', 'REAR_CHASE_LOW']).onChange(v => document.getElementById('hud-mode').innerText = v.split('_')[1]);
+
+    const fGen = gui.addFolder('Generation (Rebuilds World)');
+    fGen.add(CONFIG, 'cityDensity', 0, 1).onFinishChange(fullRebuild);
+    fGen.add(CONFIG, 'buildingScale', 0.5, 3).onFinishChange(fullRebuild);
+    fGen.add(CONFIG, 'wallThreshold', 1, 100).name('Trend Value %').onFinishChange(fullRebuild);
+    fGen.add(CONFIG, 'windowSizePct', 1, 50).name('Window Size %').onFinishChange(fullRebuild);
+
+    const fVis = gui.addFolder('Visuals (Instant)');
+    fVis.add(CONFIG, 'bloomStrength', 0, 3).onChange(updateVisuals);
+    fVis.add(CONFIG, 'bloomRadius', 0, 1).onChange(updateVisuals);
+    fVis.add(CONFIG, 'bloomThreshold', 0, 1).onChange(updateVisuals);
+    fVis.add(CONFIG, 'fogDensity', 0, 0.05).onChange(updateVisuals);
+    fVis.add(CONFIG, 'palette', Object.keys(PALETTES)).onChange(updateVisuals);
+
+    // Initial Start
+    fullRebuild();
+    document.getElementById('loader').style.display = 'none';
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth/window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        composer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+
+</script>
+</body>
+</html>

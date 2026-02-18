@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cyberpunk Live Route Visualizer V2</title>
+    <title>Cyberpunk Vertical City V4</title>
     <style>
         body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', Courier, monospace; }
         #canvas-container { width: 100vw; height: 100vh; display: block; }
@@ -16,25 +16,32 @@
             color: #0ff;
             pointer-events: none;
             text-shadow: 0 0 5px #0ff;
-            background: rgba(0, 0, 0, 0.7);
+            background: rgba(0, 5, 10, 0.85);
             padding: 15px;
             border: 1px solid #0ff;
             border-radius: 4px;
-            backdrop-filter: blur(4px);
+            backdrop-filter: blur(8px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+            z-index: 10;
         }
-        .hud-row { margin-bottom: 5px; display: flex; justify-content: space-between; min-width: 200px; }
-        .hud-label { font-weight: bold; margin-right: 15px; opacity: 0.8; }
-        .hud-value { font-weight: bold; }
-        .scan-line {
-            width: 100%; height: 2px; background: #0ff; opacity: 0.5;
-            margin-top: 10px;
-            animation: scan 2s infinite linear;
+        .hud-row { margin-bottom: 8px; display: flex; justify-content: space-between; min-width: 220px; font-size: 14px; }
+        .hud-label { font-weight: bold; margin-right: 15px; opacity: 0.7; }
+        .hud-value { font-weight: bold; text-align: right; }
+        .status-pill {
+            display: inline-block; padding: 2px 6px; border-radius: 4px; 
+            font-size: 10px; background: #111; border: 1px solid #555; margin-left: 5px;
         }
-        @keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
         
+        /* Scanline Overlay */
+        .scan-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;
+            background: repeating-linear-gradient(0deg, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,255,255,0.03) 3px, rgba(0,0,0,0) 4px);
+            z-index: 5;
+        }
+
         #loader {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: #000; display: flex; justify-content: center; align-items: center;
+            background: #020202; display: flex; justify-content: center; align-items: center;
             color: #0ff; z-index: 999; flex-direction: column;
         }
     </style>
@@ -42,16 +49,18 @@
 <body>
 
 <div id="loader">
-    <h1 style="text-shadow: 0 0 20px #0ff;">SYSTEM REBOOT...</h1>
-    <div style="font-size: 0.8em; opacity: 0.7;">Generiere Texturen & Welt</div>
+    <h1 style="text-shadow: 0 0 20px #0ff;">CONSTRUCTING MEGACITY...</h1>
+    <div style="font-size: 0.8em; opacity: 0.7; margin-top: 10px;">Building Vertical Layers</div>
 </div>
 
+<div class="scan-overlay"></div>
+
 <div id="hud">
+    <div style="border-bottom: 1px solid #0ff; margin-bottom: 10px; padding-bottom: 5px; font-weight:900;">NEURAL LINK V4.0</div>
     <div class="hud-row"><span class="hud-label">PROGRESS</span><span id="hud-progress" class="hud-value">0%</span></div>
-    <div class="hud-row"><span class="hud-label">INDEX</span><span id="hud-index" class="hud-value">0</span></div>
+    <div class="hud-row"><span class="hud-label">LEVEL</span><span id="hud-level" class="hud-value">GROUND <span class="status-pill" id="level-pill">STABLE</span></span></div>
     <div class="hud-row"><span class="hud-label">VALUE</span><span id="hud-price" class="hud-value">0.00</span></div>
     <div class="hud-row"><span class="hud-label">FPS</span><span id="hud-fps" class="hud-value">60</span></div>
-    <div class="scan-line"></div>
 </div>
 
 <div id="canvas-container"></div>
@@ -74,13 +83,23 @@
 
     // --- CONFIG ---
     const CONFIG = {
-        pointCount: 1500,
-        duration: 30,
+        duration: 90, // Sehr lang für epische Fahrt
         autoFly: true,
-        verticalAmp: 2.0, // Default höher damit man was sieht
-        bloomStrength: 1.2,
-        bloomThreshold: 0.1, // Niedriger Threshold damit mehr leuchtet
-        bloomRadius: 0.5,
+        
+        // City Generierung
+        cityDensity: 0.8,    // 0..1
+        buildingScale: 1.2,  // Multiplikator
+        
+        // Vertical Logic
+        jumpThreshold: 25,   // Wie viel Price-Change für einen "Wall Climb" nötig ist
+        levelHeight: 40,     // Höhe eines Stockwerks/Levels
+
+        // Graphics
+        bloomStrength: 1.8,
+        bloomRadius: 0.6,
+        bloomThreshold: 0.15,
+        fogDensity: 0.015,
+        
         cameraMode: 'FOLLOW_STABLE',
         palette: 'CYAN_MAGENTA'
     };
@@ -89,6 +108,7 @@
         progress: 0,
         time: 0,
         fps: 60,
+        currentLevel: 0, // Logisches Level (0 = Ground, 1 = Sky, -1 = Under)
         camForward: new THREE.Vector3(0, 0, 1),
         camPosSmoothed: new THREE.Vector3(0, 5, 0),
         camLookSmoothed: new THREE.Vector3(0, 0, 10),
@@ -97,480 +117,495 @@
         currentHeight: 0
     };
 
-    // --- HELPER: TEXTURE GENERATION ---
-    // Erzeugt Canvas-Texturen für Fenster/Lichter damit die Stadt bunt ist
-    function createBuildingTexture(primaryColor, secondaryColor) {
-        const canvas = document.createElement('canvas');
-        canvas.width = 64; canvas.height = 128; // Low res reicht für Instancing
-        const ctx = canvas.getContext('2d');
+    // --- HELPER: TEXTURES ---
+    function createBuildingTexture(p1, p2) {
+        const c = document.createElement('canvas'); c.width=64; c.height=128;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#020202'; ctx.fillRect(0,0,64,128); // Dark base
         
-        // Background dark
-        ctx.fillStyle = '#050505';
-        ctx.fillRect(0,0,64,128);
-        
-        // Random Windows
-        const colorPalette = [primaryColor, secondaryColor, '#ffffff', '#ffff00'];
-        
-        for(let i=0; i<30; i++) {
-            const c = colorPalette[Math.floor(Math.random()*colorPalette.length)];
-            ctx.fillStyle = c;
-            const x = Math.floor(Math.random()*4) * 16 + 2;
-            const y = Math.floor(Math.random()*8) * 16 + 2;
-            const w = 10;
-            const h = Math.random() > 0.8 ? 28 : 10; // Manche Fenster hoch
-            
-            if(Math.random() > 0.4) { // Nicht alles vollkleistern
-                ctx.globalAlpha = 0.8 + Math.random()*0.2; // Variation in Helligkeit
-                ctx.fillRect(x,y,w,h);
-            }
+        const cols = [p1, p2, '#ffffff', '#aaaaaa'];
+        for(let i=0; i<40; i++) {
+            ctx.fillStyle = cols[Math.floor(Math.random()*cols.length)];
+            const x = Math.floor(Math.random()*4)*16 + 2;
+            const y = Math.floor(Math.random()*8)*16 + 2;
+            const w = 10; 
+            const h = Math.random()>0.7 ? 26 : 8;
+            if(Math.random()>0.5) ctx.fillRect(x,y,w,h);
         }
-        
-        const tex = new THREE.CanvasTexture(canvas);
-        tex.magFilter = THREE.NearestFilter; // Pixel look
+        const tex = new THREE.CanvasTexture(c);
+        tex.magFilter = THREE.NearestFilter;
+        tex.colorSpace = THREE.SRGBColorSpace;
         return tex;
     }
 
-    // Erzeugt eine Noise Map für "Pfützen" auf dem Boden
-    function createRoughnessMap() {
-        const canvas = document.createElement('canvas');
-        canvas.width = 512; canvas.height = 512;
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0,0,512,512);
-        
-        for(let i=0; i<400; i++) {
-            const x = Math.random()*512;
-            const y = Math.random()*512;
-            const r = Math.random()*30 + 10;
-            const grad = ctx.createRadialGradient(x,y,0,x,y,r);
-            grad.addColorStop(0, 'rgba(0,0,0,0.8)'); // Glatt (nass)
-            grad.addColorStop(1, 'rgba(255,255,255,0)'); // Rau (trocken)
-            ctx.fillStyle = grad;
-            ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
-        }
-        
-        const tex = new THREE.CanvasTexture(canvas);
-        tex.wrapS = THREE.RepeatWrapping;
-        tex.wrapT = THREE.RepeatWrapping;
-        return tex;
+    function createFogSprite() {
+        const c = document.createElement('canvas'); c.width=128; c.height=128;
+        const ctx = c.getContext('2d');
+        const g = ctx.createRadialGradient(64,64,0,64,64,64);
+        g.addColorStop(0, 'rgba(255,255,255,0.4)');
+        g.addColorStop(0.5, 'rgba(255,255,255,0.1)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g; ctx.fillRect(0,0,128,128);
+        return new THREE.CanvasTexture(c);
     }
 
     // --- PALETTEN ---
     const PALETTES = {
-        CYAN_MAGENTA: { 
-            primary: '#00ffff', secondary: '#ff00ff', sky: 0x000510, fog: 0x000510 
-        },
-        AMBER_TEAL: { 
-            primary: '#ffae00', secondary: '#008080', sky: 0x050300, fog: 0x050300
-        },
-        NEON_GREEN_PURPLE: { 
-            primary: '#39ff14', secondary: '#9d00ff', sky: 0x020005, fog: 0x020005
-        },
-        RED_BLUE: { 
-            primary: '#ff0033', secondary: '#0033ff', sky: 0x050002, fog: 0x050002
-        },
-        SYNTHWAVE: { 
-            primary: '#ff71ce', secondary: '#01cdfe', sky: 0x180c18, fog: 0x180c18
-        }
+        CYAN_MAGENTA: { prim: '#00ffff', sec: '#ff00ff', sky: '#000810', fog: '#000810', grid: '#002233' },
+        AMBER_TEAL:   { prim: '#ffae00', sec: '#008080', sky: '#050300', fog: '#050300', grid: '#332200' },
+        NEON_GREEN:   { prim: '#39ff14', sec: '#8000ff', sky: '#020005', fog: '#020005', grid: '#113311' },
+        SYNTHWAVE:    { prim: '#ff71ce', sec: '#01cdfe', sky: '#120012', fog: '#120012', grid: '#330033' },
+        CRIMSON_DARK: { prim: '#ff0033', sec: '#aaaaaa', sky: '#080000', fog: '#080000', grid: '#330000' }
     };
 
-    // --- SCENE SETUP ---
+    // --- INIT ---
     const container = document.getElementById('canvas-container');
     const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Performance Balance
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.toneMapping = THREE.ReinhardToneMapping;
-    renderer.toneMappingExposure = 1.2;
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x000000, 0.012);
+    scene.fog = new THREE.FogExp2(0x000000, CONFIG.fogDensity);
 
-    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 2000);
     
-    // Composer
-    const renderScene = new RenderPass(scene, camera);
+    // Post Processing
+    const renderPass = new RenderPass(scene, camera);
     const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
-    // Settings init
-    bloomPass.threshold = CONFIG.bloomThreshold;
-    bloomPass.strength = CONFIG.bloomStrength;
-    bloomPass.radius = CONFIG.bloomRadius;
-
     const composer = new EffectComposer(renderer);
-    composer.addPass(renderScene);
+    composer.addPass(renderPass);
     composer.addPass(bloomPass);
 
-    // --- DATA ---
-    function generateData(count) {
-        const data = [];
-        let price = 50;
-        
-        for (let i = 0; i < count; i++) {
-            // Sinus + Noise für klarere Amplitude
-            const t = i * 0.1;
-            const sineWave = Math.sin(t * 0.5) * 10; // Langsame große Welle
-            const fastWave = Math.cos(t * 2.0) * 3;  // Schnelle kleine Welle
-            const noise = (Math.random() - 0.5) * 4;
-            
-            price = 50 + sineWave + fastWave + noise;
-            
-            // X/Z Curve
-            const x = Math.sin(i * 0.03) * 60 + Math.cos(i * 0.01) * 20;
-            const z = i * 4;
+    // --- DATA & WORLD GENERATION ---
+    
+    // Global Arrays
+    let curve;
+    let points = [];
+    let buildingsPos = []; // { pos, scale, type }
+    let verticalWalls = []; // { pos, height, width, rotation }
+    let undergroundZones = []; // { u_start, u_end }
 
-            data.push({ x, z, rawPrice: price });
+    function generateWorld() {
+        points = [];
+        buildingsPos = [];
+        verticalWalls = [];
+        undergroundZones = [];
+
+        // 1. PATH GENERATION (The "Market" Simulation)
+        let cx = 0, cz = 0;
+        let cy = 0; // Current Height Level
+        let price = 100;
+        
+        // Initial point
+        points.push(new THREE.Vector3(0,0,0));
+
+        const segmentCount = 200; // Anzahl logischer Schritte
+        const stepSize = 8;       // Distanz pro Schritt in Z (ungefähr)
+
+        for(let i=1; i<segmentCount; i++) {
+            // Trend simulieren
+            let delta = (Math.random()-0.48) * 15; // Leichter Aufwärtstrend
+            // Manchmal extreme Ausbrüche
+            if(Math.random() > 0.95) delta *= 4;
+
+            let nextPrice = price + delta;
+            
+            // Wall Climb Logic
+            // Wenn Preisunterschied zum Start des Levels zu groß wird -> Level Change
+            const levelDiff = nextPrice - price;
+            
+            let isVerticalJump = false;
+            let jumpHeight = 0;
+
+            // Check Jump Up
+            if(delta > CONFIG.jumpThreshold) {
+                isVerticalJump = true;
+                jumpHeight = CONFIG.levelHeight; 
+            } 
+            // Check Dive Down
+            else if(delta < -CONFIG.jumpThreshold) {
+                isVerticalJump = true;
+                jumpHeight = -CONFIG.levelHeight;
+            }
+
+            // Move forward (X/Z)
+            // Curvy path
+            const angle = Math.sin(i * 0.1) * 0.5 + (Math.random()-0.5)*0.5;
+            const dx = Math.sin(angle) * stepSize;
+            const dz = Math.cos(angle) * stepSize;
+            
+            cx += dx;
+            cz += dz;
+
+            if(isVerticalJump) {
+                // Füge "Wall" Points ein
+                // 1. Punkt an der Basis der Wand
+                const baseP = new THREE.Vector3(cx, cy, cz);
+                points.push(baseP);
+
+                // Update Level
+                cy += jumpHeight;
+
+                // 2. Punkt am Top der Wand (fast gleiche X/Z, nur minimal offset damit Tangente stimmt)
+                const topP = new THREE.Vector3(cx + dx*0.1, cy, cz + dz*0.1);
+                points.push(topP);
+
+                // Wall Metadata speichern (für Building Generator)
+                verticalWalls.push({
+                    pos: baseP.clone().lerp(topP, 0.5), // Mitte der Wand
+                    height: Math.abs(jumpHeight),
+                    isUp: jumpHeight > 0,
+                    lookAt: new THREE.Vector3(cx+dx, cy, cz+dz) // Wand zeigt zur Bewegung
+                });
+
+            } else {
+                // Normales Segment
+                // Wir addieren etwas Noise auf Y (Amplitude), aber bleiben auf Level-Höhe
+                const localNoise = (Math.random()-0.5) * 2.0; 
+                points.push(new THREE.Vector3(cx, cy + localNoise, cz));
+            }
+
+            price = nextPrice;
+            
+            // Detect Underground
+            if(cy < -10) {
+                // Wir sind tief unten
+                // Speichere u-range später oder markiere Punkte
+            }
         }
-        return data;
+
+        // Curve erstellen
+        curve = new THREE.CatmullRomCurve3(points);
+        curve.tension = 0.1; // Sharper corners for vertical jumps
     }
 
-    const rawData = generateData(CONFIG.pointCount);
-    // Normalize
-    const prices = rawData.map(d => d.rawPrice);
-    const minP = Math.min(...prices);
-    const maxP = Math.max(...prices);
+    // Init Data
+    generateWorld();
+
+    // --- MESH GENERATION ---
     
-    const points = rawData.map(d => ({
-        vec: new THREE.Vector3(d.x, 0, d.z),
-        normPrice: (d.rawPrice - minP) / (maxP - minP),
-        raw: d.rawPrice
-    }));
-
-    // --- CURVE ---
-    const curve = new THREE.CatmullRomCurve3(points.map(p => p.vec));
-    const tubeGeo = new THREE.TubeGeometry(curve, 1500, 0.3, 8, false); // Dickerer Trail
-    tubeGeo.setDrawRange(0, 0);
-
-    const matRoute = new THREE.MeshBasicMaterial({ color: 0xffffff }); // Wird von Palette überschrieben
+    // 1. ROUTE
+    const tubeGeo = new THREE.TubeGeometry(curve, 3000, 0.4, 8, false);
+    tubeGeo.setDrawRange(0,0);
+    const matRoute = new THREE.MeshBasicMaterial({ color: 0xffffff }); // Wird getönt
     const meshRoute = new THREE.Mesh(tubeGeo, matRoute);
     scene.add(meshRoute);
 
-    function updateCurveHeight() {
-        const positions = curve.points;
-        for(let i=0; i<positions.length; i++) {
-            // Apply Amplitude to Y
-            positions[i].y = 0.5 + points[i].normPrice * CONFIG.verticalAmp * 10; // *10 für dramatischen Effekt
+    // 2. BUILDINGS (Instanced)
+    const MAX_BUILDINGS = 4000;
+    const boxGeo = new THREE.BoxGeometry(1,1,1);
+    
+    let texBuild = createBuildingTexture('#00ffff', '#ff00ff');
+    const matBuild = new THREE.MeshStandardMaterial({
+        color: 0x111111, map: texBuild, emissiveMap: texBuild, 
+        emissive: 0xffffff, emissiveIntensity: 1.2, roughness: 0.1, metalness: 0.8
+    });
+    const iMesh = new THREE.InstancedMesh(boxGeo, matBuild, MAX_BUILDINGS);
+    scene.add(iMesh);
+
+    // 3. VERTICAL MEGASTRUCTURES (Wände an den Sprüngen)
+    const wallGeo = new THREE.BoxGeometry(1,1,1);
+    const matWall = new THREE.MeshStandardMaterial({
+        color: 0x050505, roughness: 0.2, metalness: 0.9,
+        emissive: 0x00ffff, emissiveIntensity: 0.5,
+        wireframe: false
+    });
+    // Wir nutzen normale Meshes für die wenigen Megastructures, einfacher zu handeln
+    const wallGroup = new THREE.Group();
+    scene.add(wallGroup);
+
+    // 4. FOG SPRITES (Volumetric Clouds)
+    const fogGroup = new THREE.Group();
+    const fogTex = createFogSprite();
+    const fogMat = new THREE.SpriteMaterial({ map: fogTex, color: 0x00ffff, transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending });
+    const fogSprites = [];
+    for(let i=0; i<100; i++) {
+        const s = new THREE.Sprite(fogMat);
+        s.scale.set(40,40,1);
+        fogGroup.add(s);
+        fogSprites.push({ sprite: s, offset: Math.random()*1000, speed: (Math.random()-0.5)*2 });
+    }
+    scene.add(fogGroup);
+
+    // --- PLACEMENT LOGIC (Dynamic) ---
+    function placeCity() {
+        // Reset Instance Mesh
+        iMesh.count = 0;
+        let idx = 0;
+
+        const dummy = new THREE.Object3D();
+        const curvePoints = curve.getSpacedPoints(2000); // Sampling
+
+        for(let i=0; i<curvePoints.length; i++) {
+            // Density Check
+            if(Math.random() > CONFIG.cityDensity) continue;
+            if(idx >= MAX_BUILDINGS) break;
+
+            const pt = curvePoints[i];
+            const u = i / curvePoints.length;
+            const tan = curve.getTangentAt(u);
+
+            // Skip wenn wir in einem vertikalen Segment sind (erkennbar an starkem Y-Anstieg im Tangentenvektor)
+            if(Math.abs(tan.y) > 0.5) continue; 
+
+            // Offset zur Seite
+            const norm = new THREE.Vector3(0,1,0).cross(tan).normalize();
+            const side = Math.random() > 0.5 ? 1 : -1;
+            const dist = 6 + Math.random() * 20;
+
+            dummy.position.copy(pt).add(norm.multiplyScalar(dist * side));
+            // Boden-Snap: Das Gebäude soll auf dem aktuellen Level stehen (pt.y)
+            // Aber wir runden pt.y auf das nächste Level Grid, falls gewünscht. Hier nehmen wir Curve Height.
+            dummy.position.y = pt.y; 
+
+            // Rotation Y only
+            dummy.lookAt(pt.x, dummy.position.y, pt.z);
+            
+            // Size
+            const h = (5 + Math.random() * 30) * CONFIG.buildingScale;
+            const w = (3 + Math.random() * 5) * CONFIG.buildingScale;
+            const d = (3 + Math.random() * 5) * CONFIG.buildingScale;
+
+            dummy.scale.set(w, h, d);
+            dummy.position.y += h/2; // Pivot correction
+            
+            dummy.updateMatrix();
+            iMesh.setMatrixAt(idx, dummy.matrix);
+            idx++;
         }
-        // Dirty update
-        curve.updateArcLengths();
+        iMesh.count = idx;
+        iMesh.instanceMatrix.needsUpdate = true;
+
+        // Place Megastructures (Walls)
+        // Clear old
+        while(wallGroup.children.length > 0) wallGroup.remove(wallGroup.children[0]);
         
-        // Geometrie neu bauen leider nötig bei Kurven-Update für Tube
-        // Performance OK da nur bei Slider change
-        const newGeo = new THREE.TubeGeometry(curve, 1500, 0.3, 8, false);
-        tubeGeo.copy(newGeo);
-        // DrawRange reset verhindern wir im Loop
-    }
-    updateCurveHeight();
+        verticalWalls.forEach(w => {
+            const wall = new THREE.Mesh(wallGeo, matWall);
+            wall.position.copy(w.pos);
+            wall.scale.set(15, w.height, 15); // Massiver Turm
+            
+            // Ausrichtung
+            wall.lookAt(w.lookAt);
+            
+            // Texturierung oder Details hinzufügen?
+            // Wir fügen einfache Lichtstreifen hinzu (Scale trick)
+            const strip = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1, 1.1), new THREE.MeshBasicMaterial({color: 0xffffff}));
+            strip.scale.set(1, w.height, 0.2);
+            wall.add(strip);
+            
+            wallGroup.add(wall);
+        });
 
-    // --- CITY ASSETS ---
-    const cityGroup = new THREE.Group();
-    scene.add(cityGroup);
-
-    // Textures
-    let buildingTex = createBuildingTexture('#00ffff', '#ff00ff');
-
-    // Materials
-    const matBuilding = new THREE.MeshStandardMaterial({
-        color: 0x222222,
-        map: buildingTex,
-        emissiveMap: buildingTex,
-        emissive: 0xffffff,
-        emissiveIntensity: 1.5, // Bright!
-        roughness: 0.2,
-        metalness: 0.8
-    });
-
-    const matRoof = new THREE.MeshBasicMaterial({ color: 0x111111 });
-
-    // Instanced Mesh Construction
-    const count = 700;
-    const iMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1), matBuilding, count);
-    const iMeshRoof = new THREE.InstancedMesh(new THREE.BoxGeometry(1,0.1,1), matRoof, count);
-    cityGroup.add(iMesh);
-    cityGroup.add(iMeshRoof);
-
-    const dummy = new THREE.Object3D();
-    const curvePoints = curve.getSpacedPoints(count);
-
-    for(let i=0; i<count; i++) {
-        const u = i/count;
-        const pt = curvePoints[i];
-        const tan = curve.getTangentAt(u);
-        const norm = new THREE.Vector3(0,1,0).cross(tan).normalize();
-        
-        const side = Math.random() > 0.5 ? 1 : -1;
-        const dist = 5 + Math.random() * 15;
-        
-        // Position
-        dummy.position.copy(pt).add(norm.clone().multiplyScalar(dist * side));
-        dummy.position.y = 0; // Ground
-        
-        // Rotation
-        dummy.lookAt(pt);
-        
-        // Scale based on Data + Random
-        const dataIdx = Math.floor(u * (points.length-1));
-        const val = points[dataIdx].normPrice;
-        const h = 4 + val * 20 + Math.random() * 10;
-        const w = 2 + Math.random() * 3;
-        const d = 2 + Math.random() * 3;
-        
-        dummy.scale.set(w, h, d);
-        dummy.position.y = h/2; // Center Pivot fix
-        dummy.updateMatrix();
-        iMesh.setMatrixAt(i, dummy.matrix);
-        
-        // Roof top
-        dummy.scale.set(w*0.9, 1, d*0.9);
-        dummy.position.y = h + 0.05;
-        dummy.updateMatrix();
-        iMeshRoof.setMatrixAt(i, dummy.matrix);
-    }
-
-    // --- CRAZY OBJECTS (Tunnels, Rings, Sculptures) ---
-    const crazyGroup = new THREE.Group();
-    scene.add(crazyGroup);
-    
-    // Mat for crazy objects
-    const matCrazy = new THREE.MeshStandardMaterial({ 
-        color: 0x444444, roughness: 0.1, metalness: 0.9, 
-        emissive: 0xff00ff, emissiveIntensity: 0.5, wireframe: false 
-    });
-
-    // 1. Torus Knots als Skulpturen
-    const knotGeo = new THREE.TorusKnotGeometry(2, 0.4, 64, 8);
-    for(let i=0; i<5; i++) {
-        const u = 0.15 + i * 0.2;
-        const pt = curve.getPointAt(u);
-        const mesh = new THREE.Mesh(knotGeo, matCrazy);
-        mesh.position.copy(pt);
-        mesh.position.y += 10;
-        mesh.scale.setScalar(2 + Math.random());
-        crazyGroup.add(mesh);
-    }
-
-    // 2. Tunnel / Gates
-    const gateGeo = new THREE.TorusGeometry(6, 0.5, 8, 20, Math.PI * 2); // Ring
-    for(let i=0; i<8; i++) {
-        const u = 0.1 + i * 0.12;
-        const pt = curve.getPointAt(u);
-        const tan = curve.getTangentAt(u);
-        
-        const gate = new THREE.Mesh(gateGeo, matCrazy);
-        gate.position.copy(pt);
-        gate.position.y += 2; // Curve center
-        gate.lookAt(pt.clone().add(tan));
-        crazyGroup.add(gate);
-    }
-
-    // --- MOON ---
-    const moonGeo = new THREE.SphereGeometry(40, 32, 32);
-    const moonMat = new THREE.MeshBasicMaterial({ 
-        color: 0xffffff, 
-        map: createRoughnessMap() // Missbrauche Roughness Map als Mond Texture :D
-    }); 
-    const moon = new THREE.Mesh(moonGeo, moonMat);
-    scene.add(moon);
-
-    // --- FLOOR ---
-    const floorTex = createRoughnessMap();
-    floorTex.repeat.set(50,50);
-    const matFloor = new THREE.MeshStandardMaterial({
-        color: 0x050505,
-        roughnessMap: floorTex,
-        roughness: 0.1, // Sehr glatt wo schwarz (nass)
-        metalness: 0.9,
-    });
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), matFloor);
-    floor.rotation.x = -Math.PI/2;
-    scene.add(floor);
-
-    // --- TAXIS ---
-    const taxiGroup = new THREE.Group();
-    scene.add(taxiGroup);
-    const taxis = [];
-    const taxiGeo = new THREE.BoxGeometry(0.8, 0.2, 1.2);
-    const taxiMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
-    
-    for(let i=0; i<15; i++) {
-        const mesh = new THREE.Mesh(taxiGeo, taxiMat);
-        // Add random engine lights
-        const light = new THREE.PointLight(0xff0000, 1, 5);
-        light.position.set(0,0,0.6);
-        mesh.add(light);
-        
-        taxiGroup.add(mesh);
-        taxis.push({
-            mesh,
-            u: Math.random(),
-            speed: 0.03 + Math.random() * 0.05,
-            offset: new THREE.Vector3((Math.random()-0.5)*10, 2+Math.random()*8, 0)
+        // Place Fog Sprites along curve
+        fogSprites.forEach((f, i) => {
+            const u = Math.random();
+            const pt = curve.getPointAt(u);
+            f.sprite.position.copy(pt).add(new THREE.Vector3((Math.random()-0.5)*100, (Math.random()-0.5)*30, (Math.random()-0.5)*100));
         });
     }
 
-    // --- HEAD ---
-    const headMesh = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.5, 4), new THREE.MeshBasicMaterial({color:0xffffff, wireframe:true}));
-    headMesh.rotateX(Math.PI/2);
-    const headLight = new THREE.PointLight(0xffffff, 3, 20);
+    // Initial Place
+    placeCity();
+
+
+    // --- ASSETS (Props) ---
+    // Floor Grid (Infinity Illusion)
+    const gridHelper = new THREE.GridHelper(4000, 400, 0x111111, 0x050505);
+    gridHelper.position.y = -2; // Slightly below lowest point
+    scene.add(gridHelper);
+
+    // Head Marker
     const headGroup = new THREE.Group();
-    headGroup.add(headMesh);
-    headGroup.add(headLight);
+    const headGeo = new THREE.ConeGeometry(0.5, 1.5, 4); headGeo.rotateX(Math.PI/2);
+    const headMesh = new THREE.Mesh(headGeo, new THREE.MeshBasicMaterial({ wireframe: true, color: 0xffffff }));
+    const headLight = new THREE.PointLight(0xffffff, 2, 30);
+    headGroup.add(headMesh); headGroup.add(headLight);
     scene.add(headGroup);
 
-
-    // --- LOGIC ---
-    function applyPalette(key) {
-        const p = PALETTES[key];
-        if(!p) return;
-        
-        // Colors Update
-        const cPrim = new THREE.Color(p.primary);
-        const cSec = new THREE.Color(p.secondary);
-        
-        matRoute.color.set(cPrim);
-        moonMat.color.set(cSec).lerp(new THREE.Color(0xffffff), 0.5);
-        headLight.color.set(cPrim);
-        matCrazy.emissive.set(cSec);
-        
-        scene.fog.color.setHex(p.fog);
-        renderer.setClearColor(p.sky);
-        
-        // New texture generation with correct colors
-        const newTex = createBuildingTexture(p.primary, p.secondary);
-        matBuilding.map = newTex;
-        matBuilding.emissiveMap = newTex;
-        matBuilding.needsUpdate = true;
-        
-        // UI
-        document.getElementById('hud').style.borderColor = p.primary;
-        document.getElementById('hud').style.color = p.primary;
-        document.querySelectorAll('.scan-line').forEach(e => e.style.background = p.primary);
+    // --- GUI & LOGIC ---
+    function updateWorldParams() {
+        placeCity();
+        bloomPass.threshold = CONFIG.bloomThreshold;
+        bloomPass.strength = CONFIG.bloomStrength;
+        bloomPass.radius = CONFIG.bloomRadius;
+        scene.fog.density = CONFIG.fogDensity;
     }
 
+    function applyPalette(key) {
+        const p = PALETTES[key];
+        // Colors
+        matRoute.color.set(p.prim);
+        matWall.emissive.set(p.prim);
+        headLight.color.set(p.prim);
+        fogMat.color.set(p.sec);
+        
+        // Background & Fog
+        scene.background = new THREE.Color(p.sky);
+        scene.fog.color.set(p.fog);
+        
+        // Texture Regen
+        const newTex = createBuildingTexture(p.prim, p.sec);
+        matBuild.map = newTex; matBuild.emissiveMap = newTex; matBuild.needsUpdate = true;
+        
+        // UI Colors
+        document.getElementById('hud').style.borderColor = p.prim;
+        document.querySelectorAll('.hud-value').forEach(e => e.style.color = p.prim);
+    }
 
-    // --- GUI ---
-    const gui = new GUI({ title: 'CYBER CONTROL V2' });
-    gui.add(CONFIG, 'verticalAmp', 0, 5).name('Vert Amplitude').onChange(updateCurveHeight);
-    gui.add(CONFIG, 'bloomStrength', 0, 3).name('Bloom Glow').onChange(v => bloomPass.strength = v);
-    gui.add(CONFIG, 'bloomRadius', 0, 1).name('Bloom Radius').onChange(v => bloomPass.radius = v);
-    gui.add(CONFIG, 'bloomThreshold', 0, 1).name('Bloom Thresh').onChange(v => bloomPass.threshold = v);
-    gui.add(CONFIG, 'cameraMode', ['FOLLOW_STABLE', 'FOLLOW_SWAY', 'DRONE_ORBIT', 'REAR_CHASE_LOW']).name('Cam Mode');
-    gui.add(CONFIG, 'palette', Object.keys(PALETTES)).name('Palette').onChange(applyPalette);
+    const gui = new GUI({ title: 'CYBER CONTROL V4' });
+    const fGen = gui.addFolder('Generation');
+    fGen.add(CONFIG, 'cityDensity', 0, 1).onChange(placeCity);
+    fGen.add(CONFIG, 'buildingScale', 0.5, 3).onChange(placeCity);
+    fGen.add(CONFIG, 'jumpThreshold', 10, 50).name('Wall Threshold').onFinishChange(generateWorld); // Rebuild world needed
+    
+    const fVis = gui.addFolder('Visuals');
+    fVis.add(CONFIG, 'bloomStrength', 0, 3).onChange(updateWorldParams);
+    fVis.add(CONFIG, 'bloomRadius', 0, 1).onChange(updateWorldParams);
+    fVis.add(CONFIG, 'fogDensity', 0, 0.05).onChange(updateWorldParams);
+    fVis.add(CONFIG, 'palette', Object.keys(PALETTES)).onChange(applyPalette);
+    
+    gui.add(CONFIG, 'cameraMode', ['FOLLOW_STABLE', 'FOLLOW_SWAY', 'DRONE_ORBIT', 'REAR_CHASE_LOW']);
+    gui.add(CONFIG, 'duration', 30, 180).name('Loop Time');
 
     applyPalette('CYAN_MAGENTA');
     document.getElementById('loader').style.display = 'none';
 
-    // --- ANIM LOOP ---
+    // --- ANIMATION ---
     const clock = new THREE.Clock();
-    
     const _headPos = new THREE.Vector3();
     const _backPos = new THREE.Vector3();
     const _forward = new THREE.Vector3();
     const _up = new THREE.Vector3(0,1,0);
-    
+
     function animate() {
         requestAnimationFrame(animate);
         const dt = Math.min(clock.getDelta(), 0.1);
         STATE.time += dt;
-        
+
+        // Progress
         if(CONFIG.autoFly) {
             STATE.progress += dt / CONFIG.duration;
             if(STATE.progress > 1) STATE.progress = 0;
         }
         const u = STATE.progress;
 
-        // Route DrawRange
-        const total = 1500 * 8 * 6;
-        const visible = Math.floor(u * total);
-        const safe = Math.floor(visible / 48) * 48; // safe segment align
-        tubeGeo.setDrawRange(0, safe);
+        // Route Visibility
+        // Tube Geometry: ca 3000 segments * 8 radial * 6 indices
+        const totalIndices = 3000 * 8 * 6;
+        const drawCount = Math.floor(u * totalIndices);
+        // Align to segment size (48 indices per segment)
+        tubeGeo.setDrawRange(0, Math.floor(drawCount / 48) * 48);
 
-        // Head
+        // Head Position
         curve.getPointAt(u, _headPos);
         const tan = curve.getTangentAt(u);
         headGroup.position.copy(_headPos);
-        headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), tan);
+        
+        // Head Orientation (Achte auf Vertikale Sprünge)
+        // Bei senkrechtem Flug (tan.y ~ 1 oder -1) müssen wir Quaternion aufpassen
+        if(Math.abs(tan.y) > 0.9) {
+            // Wir klettern
+            headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), tan);
+        } else {
+            headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), tan);
+        }
 
-        // Camera Logic (Reuse stable logic)
-        const lookBackDelta = 0.02;
-        if (u < 0.02) _forward.copy(curve.getTangentAt(0));
+        // --- CAMERA LOGIC ---
+        // Back-Vector Berechnung für stabile Ausrichtung
+        const lookBack = 0.005;
+        if(u < lookBack) _forward.copy(curve.getTangentAt(0));
         else {
-            curve.getPointAt(u - lookBackDelta, _backPos);
+            curve.getPointAt(u - lookBack, _backPos);
             _forward.subVectors(_headPos, _backPos).normalize();
         }
         
-        // Anti-Flip
-        if(_forward.dot(STATE.camForward) > 0 || u < 0.05) {
-             STATE.camForward.lerp(_forward, dt * 3.0);
+        // Stabilisierung
+        if(_forward.lengthSq() > 0.5) { // Nur wenn bewegung da ist
+             STATE.camForward.lerp(_forward, dt * 2.0);
         }
 
-        // Cam Modes
-        let tDist = 6, tHeight = 3, tLook = 5;
-        let swayX = 0, swayY = 0;
-        
-        if(CONFIG.cameraMode === 'FOLLOW_STABLE') { tDist=8; tHeight=4; tLook=10; }
-        if(CONFIG.cameraMode === 'FOLLOW_SWAY') { 
-            tDist=7; tHeight=3; tLook=8; 
-            swayX = Math.sin(STATE.time)*1.5; swayY = Math.cos(STATE.time*0.7)*0.5; 
+        // Camera Modes
+        let tDist=8, tHeight=4, tLook=6;
+        let swayX=0, swayY=0;
+
+        // Automatische Anpassung bei Wall Climb
+        // Wenn wir steil nach oben/unten fliegen, Abstand vergrößern für Übersicht
+        if(Math.abs(_forward.y) > 0.5) {
+            tDist = 15; 
+            tHeight = 0; // Hinter dem Head bleiben, nicht darüber
         }
-        if(CONFIG.cameraMode === 'DRONE_ORBIT') { 
-            tDist=15; tHeight=8; tLook=2; 
-            swayX = Math.sin(STATE.time*0.3)*10; 
+
+        if(CONFIG.cameraMode === 'FOLLOW_STABLE') { /* defaults */ }
+        else if(CONFIG.cameraMode === 'DRONE_ORBIT') {
+            tDist = 15; tLook = 0;
+            swayX = Math.sin(STATE.time * 0.5) * 10;
+            tHeight = 8 + Math.cos(STATE.time * 0.3) * 4;
         }
-        if(CONFIG.cameraMode === 'REAR_CHASE_LOW') { tDist=4; tHeight=1.5; tLook=15; }
 
         STATE.currentDist += (tDist - STATE.currentDist) * dt * 2;
         STATE.currentHeight += (tHeight - STATE.currentHeight) * dt * 2;
+
+        const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), STATE.camForward).normalize();
         
-        const right = new THREE.Vector3().crossVectors(_up, STATE.camForward).normalize();
+        // Target Calc
         const targetPos = _headPos.clone()
             .sub(STATE.camForward.clone().multiplyScalar(STATE.currentDist))
-            .add(_up.clone().multiplyScalar(STATE.currentHeight))
-            .add(right.multiplyScalar(swayX)).add(_up.clone().multiplyScalar(swayY));
-            
-        STATE.camPosSmoothed.lerp(targetPos, dt * 4); // schnellerer follow
+            .add(new THREE.Vector3(0, STATE.currentHeight, 0))
+            .add(right.multiplyScalar(swayX));
+
+        STATE.camPosSmoothed.lerp(targetPos, dt * 3.0);
         camera.position.copy(STATE.camPosSmoothed);
         
         const targetLook = _headPos.clone().add(STATE.camForward.clone().multiplyScalar(tLook));
-        STATE.camLookSmoothed.lerp(targetLook, dt * 4);
+        STATE.camLookSmoothed.lerp(targetLook, dt * 4.0);
         camera.lookAt(STATE.camLookSmoothed);
 
-        // Intro Lift
-        if(STATE.time < 2) camera.position.y += (2-STATE.time)*5;
-
-        // Moon Position (Parallax fake: immer hinten oben rechts)
-        const moonDist = 400;
-        const moonOffset = new THREE.Vector3(100, 150, -300); // Relativ zur Cam
-        moonOffset.applyQuaternion(camera.quaternion); // Mitdrehen? Nein, statisch im Sky besser
-        // Einfacher: Fixe Position relativ zum Head aber weit weg
-        moon.position.copy(_headPos).add(new THREE.Vector3(100, 200, 400));
-        moon.lookAt(camera.position); // Billboard effect
-
-        // Taxis
-        taxis.forEach(t => {
-            t.u += t.speed * dt;
-            if(t.u > 1) t.u = 0;
-            const pt = curve.getPointAt(t.u);
-            const ttan = curve.getTangentAt(t.u);
-            const norm = new THREE.Vector3(0,1,0).cross(ttan).normalize();
+        // --- ATMOSPHERE UPDATE ---
+        // Wenn wir unter Y=0 sind (Underground) -> Rotes Licht / Dunkler Nebel
+        if(_headPos.y < -5) {
+            // Smooth transition zu Underground Theme
+            const darkColor = new THREE.Color(0x110000);
+            scene.fog.color.lerp(darkColor, dt);
+            scene.background.lerp(new THREE.Color(0x000000), dt);
+            document.getElementById('level-pill').innerText = "UNDERGROUND";
+            document.getElementById('level-pill').style.color = "red";
+            document.getElementById('level-pill').style.borderColor = "red";
+        } else {
+            // Zurück zum Standard (Palette Sky)
+            const p = PALETTES[CONFIG.palette];
+            scene.fog.color.lerp(new THREE.Color(p.fog), dt);
+            scene.background.lerp(new THREE.Color(p.sky), dt);
             
-            // Fly along curve but with offset
-            const finalPos = pt.clone().add(norm.multiplyScalar(t.offset.x)).add(new THREE.Vector3(0, t.offset.y, 0));
-            t.mesh.position.copy(finalPos);
-            t.mesh.lookAt(finalPos.clone().add(ttan));
-        });
-
-        // Crazy Objects Rotation
-        crazyGroup.children.forEach((child, i) => {
-            if(child.geometry.type === 'TorusKnotGeometry') {
-                child.rotation.x += dt * 0.2;
-                child.rotation.y += dt * 0.1;
+            if(_headPos.y > 20) {
+                 document.getElementById('level-pill').innerText = "SKY LEVEL";
+                 document.getElementById('level-pill').style.color = "#0ff";
+                 document.getElementById('level-pill').style.borderColor = "#0ff";
+            } else {
+                 document.getElementById('level-pill').innerText = "GROUND";
+                 document.getElementById('level-pill').style.color = "#aaa";
+                 document.getElementById('level-pill').style.borderColor = "#aaa";
             }
+        }
+
+        // Fog Sprites Animation
+        fogSprites.forEach(f => {
+            // Move slowly
+            f.sprite.position.x += f.speed * dt;
+            // Wrap around camera
+            const d = f.sprite.position.distanceTo(camera.position);
+            if(d > 200) {
+                f.sprite.position.copy(camera.position).add(new THREE.Vector3((Math.random()-0.5)*100, (Math.random()-0.5)*20, (Math.random()-0.5)*100));
+            }
+            f.sprite.lookAt(camera.position);
         });
 
-        // HUD
-        const idx = Math.floor(u * (points.length-1));
-        document.getElementById('hud-progress').innerText = Math.floor(u*100)+'%';
-        document.getElementById('hud-price').innerText = points[idx].raw.toFixed(2);
+        // HUD Update
+        document.getElementById('hud-progress').innerText = Math.floor(u*100) + '%';
+        // Preis aus Y berechnen (ungefähr)
+        document.getElementById('hud-price').innerText = (100 + _headPos.y).toFixed(2);
         document.getElementById('hud-fps').innerText = Math.round(1/dt);
 
         composer.render();
